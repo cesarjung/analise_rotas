@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ambientes virtuais
+.venv/
+venv/
+
+# Variáveis de ambiente
+.env
+.env.*
+*.env
+
+# Streamlit (NUNCA comitar segredos)
+.streamlit/secrets.toml
+
+# SO/Lixo de editor
+.DS_Store
+Thumbs.db
+.vscode/
+.ipynb_checkpoints/
