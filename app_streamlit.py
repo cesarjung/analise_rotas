@@ -11,7 +11,13 @@ import streamlit as st
 import folium
 from streamlit.components.v1 import html
 
-st.set_page_config(page_title="Mapa + Tabela (GPM)", layout="wide")
+st.set_page_config(page_title="Cadastro x Executado", layout="wide")
+
+# -----------------------------
+# Session state (persistência)
+# -----------------------------
+if "df" not in st.session_state:
+    st.session_state.df = None  # guarda a base carregada (upload ou gsheet)
 
 # =============================
 # Helpers
@@ -21,13 +27,11 @@ def to_float(x):
         return np.nan
     if isinstance(x, (int, float)):
         return float(x)
-    s = str(x).strip()
-    s = s.replace(",", ".")
-    import re
+    s = str(x).strip().replace(",", ".")
     s = re.sub(r"[^0-9\.\-]+", "", s)
     try:
         return float(s)
-    except:
+    except Exception:
         return np.nan
 
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -60,7 +64,7 @@ def read_any(file_or_path, sep_guess=","):
                 return pd.read_csv(file_or_path, sep=None, engine="python", encoding="latin1")
     else:
         p = Path(file_or_path)
-        if p.suffix.lower() == ".xlsx":
+        if p.suffix.lower() in [".xlsx", ".xls"]:
             return pd.read_excel(p)
         else:
             try:
@@ -69,12 +73,12 @@ def read_any(file_or_path, sep_guess=","):
                 return pd.read_csv(p, sep=None, engine="python", encoding="latin1")
 
 def normcols(cols):
-    import unicodedata, re
+    import unicodedata, re as _re
     out = []
     for c in cols:
         s = ''.join(ch for ch in unicodedata.normalize('NFKD', str(c)) if not unicodedata.combining(ch))
         s = s.lower().strip()
-        s = re.sub(r'[^a-z0-9]+', '_', s).strip('_')
+        s = _re.sub(r'[^a-z0-9]+', '_', s).strip('_')
         out.append(s)
     return out
 
@@ -125,19 +129,24 @@ with st.sidebar:
     # ---- Bases (Fonte de dados) ----
     with st.expander("📂 Bases / Fonte de dados", expanded=True):
         source = st.radio("Escolha a fonte", ["Upload (.csv/.xlsx)", "Google Sheets"], index=0)
-        df = None
+        # use a base já carregada, se existir
+        df = st.session_state.df
 
         if source == "Upload (.csv/.xlsx)":
             uploaded = st.file_uploader("Relatório", type=["csv", "xlsx"])
             use_sample = st.checkbox("Usar arquivo de exemplo (anexado aqui)", value=False)
             sample_path = "/mnt/data/Consulta Serviços.csv"
+
             if uploaded is not None:
-                df = read_any(uploaded)
+                st.session_state.df = read_any(uploaded)
+                st.success("Arquivo carregado.")
             elif use_sample and Path(sample_path).exists():
-                df = read_any(sample_path)
-                st.success("Usando o arquivo de exemplo anexado anteriormente.")
-            else:
-                st.info("Envie um arquivo ou marque 'Usar arquivo de exemplo'.")
+                st.session_state.df = read_any(sample_path)
+                st.success("Arquivo de exemplo carregado.")
+            # botão opcional para limpar
+            if st.button("Limpar base", use_container_width=True):
+                st.session_state.df = None
+
         else:
             gurl = st.text_input(
                 "URL do Google Sheets",
@@ -148,9 +157,10 @@ with st.sidebar:
             c1, c2 = st.columns(2)
             header_row = c1.number_input("Linha do cabeçalho", min_value=1, value=2, step=1)
             data_row_start = c2.number_input("Dados começam na linha", min_value=1, value=3, step=1)
+
             if st.button("Carregar do Google Sheets", use_container_width=True, type="primary"):
                 try:
-                    df = read_gsheet(
+                    st.session_state.df = read_gsheet(
                         gurl,
                         gsheet_name.strip() or None,
                         header_row=int(header_row),
@@ -160,16 +170,26 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"Falha ao carregar: {e}")
 
-    if 'df' not in locals() or df is None:
-        st.stop()
+            if st.button("Limpar base", use_container_width=True):
+                st.session_state.df = None
 
-    # ---- Mapeamento de colunas ----
+# Se não há base, parar aqui (sem exigir recarregar ao mover filtros depois do load)
+if st.session_state.df is None:
+    st.info("Carregue uma base (upload ou Google Sheets) para continuar.")
+    st.stop()
+
+# Trabalhe SEMPRE numa cópia, para não alterar o df salvo na sessão
+df = st.session_state.df.copy()
+
+# ---- Mapeamento de colunas ----
+with st.sidebar:
     with st.expander("🧭 Mapeamento de colunas", expanded=True):
         orig_cols = list(df.columns)
         norm = normcols(orig_cols)
         df.columns = norm
 
         defaults = {
+            "nota": "numero_da_nota",            # NOVO: coluna F
             "tipo": "tipo_servico",
             "lat_exec": "latitude_servico",
             "lon_exec": "longitude_servico",
@@ -181,7 +201,7 @@ with st.sidebar:
             "fim_desloc": "fim_desloc",
             "ini_exec": "inicio_exec",
             "fim_exec": "fim_exec",
-            "centro": "centro_de_servico",  # AU (novo)
+            "centro": "centro_de_servico",       # AU
         }
 
         def guess(contains):
@@ -191,6 +211,7 @@ with st.sidebar:
             return None
 
         guessed = {
+            "nota": defaults["nota"] if defaults["nota"] in df.columns else guess(["nota"]),
             "tipo": defaults["tipo"] if defaults["tipo"] in df.columns else guess(["tipo"]),
             "lat_exec": defaults["lat_exec"] if defaults["lat_exec"] in df.columns else guess(["lat","exec"]),
             "lon_exec": defaults["lon_exec"] if defaults["lon_exec"] in df.columns else guess(["lon","exec"]),
@@ -205,22 +226,37 @@ with st.sidebar:
             "centro": defaults["centro"] if defaults["centro"] in df.columns else guess(["centro","servico"]),
         }
 
+        # Selectboxes
+        nota_col = st.selectbox("Número da Nota (F)", options=["<nenhum>"] + list(df.columns),
+                                index=(df.columns.get_loc(guessed["nota"]) + 1) if guessed["nota"] in df.columns else 0)
         col1, col2 = st.columns(2)
-        lat_cad_col = col1.selectbox("Latitude cadastrada (BK)", options=df.columns, index=max(df.columns.get_loc(guessed["lat_cad"]) if guessed["lat_cad"] in df.columns else 0, 0))
-        lon_cad_col = col2.selectbox("Longitude cadastrada (BL)", options=df.columns, index=max(df.columns.get_loc(guessed["lon_cad"]) if guessed["lon_cad"] in df.columns else 0, 0))
+        lat_cad_col = col1.selectbox("Latitude cadastrada (BK)", options=df.columns,
+                                     index=max(df.columns.get_loc(guessed["lat_cad"]) if guessed["lat_cad"] in df.columns else 0, 0))
+        lon_cad_col = col2.selectbox("Longitude cadastrada (BL)", options=df.columns,
+                                     index=max(df.columns.get_loc(guessed["lon_cad"]) if guessed["lon_cad"] in df.columns else 0, 0))
         col3, col4 = st.columns(2)
-        lat_exec_col = col3.selectbox("Latitude executada (BG)", options=df.columns, index=max(df.columns.get_loc(guessed["lat_exec"]) if guessed["lat_exec"] in df.columns else 0, 0))
-        lon_exec_col = col4.selectbox("Longitude executada (BH)", options=df.columns, index=max(df.columns.get_loc(guessed["lon_exec"]) if guessed["lon_exec"] in df.columns else 0, 0))
+        lat_exec_col = col3.selectbox("Latitude executada (BG)", options=df.columns,
+                                      index=max(df.columns.get_loc(guessed["lat_exec"]) if guessed["lat_exec"] in df.columns else 0, 0))
+        lon_exec_col = col4.selectbox("Longitude executada (BH)", options=df.columns,
+                                      index=max(df.columns.get_loc(guessed["lon_exec"]) if guessed["lon_exec"] in df.columns else 0, 0))
 
-        tipo_col = st.selectbox("Tipo de serviço (G)", options=["<nenhum>"] + list(df.columns), index=(df.columns.get_loc(guessed["tipo"]) + 1) if guessed["tipo"] in df.columns else 0)
-        equipe_col = st.selectbox("Equipe (AX)", options=["<nenhum>"] + list(df.columns), index=(df.columns.get_loc(guessed["equipe"]) + 1) if guessed["equipe"] in df.columns else 0)
-        data_col = st.selectbox("Data de execução (BP)", options=["<nenhum>"] + list(df.columns), index=(df.columns.get_loc(guessed["data"]) + 1) if guessed["data"] in df.columns else 0)
-        centro_col = st.selectbox("Centro de Serviço (AU)", options=["<nenhum>"] + list(df.columns), index=(df.columns.get_loc(guessed["centro"]) + 1) if guessed["centro"] in df.columns else 0)
+        tipo_col = st.selectbox("Tipo de serviço (G)", options=["<nenhum>"] + list(df.columns),
+                                index=(df.columns.get_loc(guessed["tipo"]) + 1) if guessed["tipo"] in df.columns else 0)
+        equipe_col = st.selectbox("Equipe (AX)", options=["<nenhum>"] + list(df.columns),
+                                  index=(df.columns.get_loc(guessed["equipe"]) + 1) if guessed["equipe"] in df.columns else 0)
+        data_col = st.selectbox("Data de execução (BP)", options=["<nenhum>"] + list(df.columns),
+                                index=(df.columns.get_loc(guessed["data"]) + 1) if guessed["data"] in df.columns else 0)
+        centro_col = st.selectbox("Centro de Serviço (AU)", options=["<nenhum>"] + list(df.columns),
+                                  index=(df.columns.get_loc(guessed["centro"]) + 1) if guessed["centro"] in df.columns else 0)
 
-        ini_desloc_col = st.selectbox("Início deslocamento (AF)", options=["<nenhum>"] + list(df.columns), index=(df.columns.get_loc(guessed["ini_desloc"]) + 1) if guessed["ini_desloc"] in df.columns else 0)
-        fim_desloc_col = st.selectbox("Fim deslocamento (AG)", options=["<nenhum>"] + list(df.columns), index=(df.columns.get_loc(guessed["fim_desloc"]) + 1) if guessed["fim_desloc"] in df.columns else 0)
-        ini_exec_col = st.selectbox("Início execução (AH)", options=["<nenhum>"] + list(df.columns), index=(df.columns.get_loc(guessed["ini_exec"]) + 1) if guessed["ini_exec"] in df.columns else 0)
-        fim_exec_col = st.selectbox("Fim execução (AI)", options=["<nenhum>"] + list(df.columns), index=(df.columns.get_loc(guessed["fim_exec"]) + 1) if guessed["fim_exec"] in df.columns else 0)
+        ini_desloc_col = st.selectbox("Início deslocamento (AF)", options=["<nenhum>"] + list(df.columns),
+                                      index=(df.columns.get_loc(guessed["ini_desloc"]) + 1) if guessed["ini_desloc"] in df.columns else 0)
+        fim_desloc_col = st.selectbox("Fim deslocamento (AG)", options=["<nenhum>"] + list(df.columns),
+                                      index=(df.columns.get_loc(guessed["fim_desloc"]) + 1) if guessed["fim_desloc"] in df.columns else 0)
+        ini_exec_col = st.selectbox("Início execução (AH)", options=["<nenhum>"] + list(df.columns),
+                                    index=(df.columns.get_loc(guessed["ini_exec"]) + 1) if guessed["ini_exec"] in df.columns else 0)
+        fim_exec_col = st.selectbox("Fim execução (AI)", options=["<nenhum>"] + list(df.columns),
+                                    index=(df.columns.get_loc(guessed["fim_exec"]) + 1) if guessed["fim_exec"] in df.columns else 0)
 
 # =============================
 # Preparação de dados
@@ -270,7 +306,7 @@ with st.expander("Filtros", expanded=True):
         tipos = c2.multiselect("Tipo", tp_opts)
 
     centros = None
-    if 'centro_col' in locals() and centro_col != "<nenhum>":
+    if centro_col != "<nenhum>":
         cs_opts = sorted([x for x in df_valid[centro_col].dropna().astype(str).unique().tolist()])
         centros = c3.multiselect("Centro de Serviço", cs_opts)
 
@@ -310,13 +346,22 @@ m4.metric(f">% {limite_m} m", f"{(fdf['dist_m'] > limite_m).mean()*100:.1f}%" if
 # =============================
 st.subheader("Tabela")
 cols_show = []
-for cand in [equipe_col, tipo_col, centro_col if 'centro_col' in locals() else "<nenhum>", data_col, ini_desloc_col, fim_desloc_col, ini_exec_col, fim_exec_col]:
+# 1ª coluna: Número da Nota (se mapeado)
+if nota_col != "<nenhum>":
+    cols_show.append(nota_col)
+
+# Demais colunas informativas
+for cand in [equipe_col, tipo_col, centro_col if centro_col != "<nenhum>" else None,
+             data_col, ini_desloc_col, fim_desloc_col, ini_exec_col, fim_exec_col]:
     if cand and cand != "<nenhum>":
         cols_show.append(cand)
+
+# Coordenadas e distâncias
 cols_show += [lat_cad_col, lon_cad_col, lat_exec_col, lon_exec_col, "dist_m", "dist_km"]
 
 st.dataframe(fdf[cols_show].sort_values("dist_m", ascending=False), use_container_width=True)
 
+# Download Excel (com Número da Nota como 1ª coluna se existir)
 buf = io.BytesIO()
 fdf[cols_show].to_excel(buf, index=False)
 st.download_button("⬇️ Baixar Excel filtrado", data=buf.getvalue(),
@@ -341,9 +386,11 @@ else:
 
     def tooltip_html(row):
         parts = []
+        if nota_col != "<nenhum>":
+            parts.append(f"<b>Nº Nota:</b> {row.get(nota_col, '')}")
         if tipo_col != "<nenhum>":
             parts.append(f"<b>Tipo de serviço:</b> {row.get(tipo_col, '')}")
-        if 'centro_col' in locals() and centro_col != "<nenhum>":
+        if centro_col != "<nenhum>":
             parts.append(f"<b>Centro de Serviço:</b> {row.get(centro_col, '')}")
         if equipe_col != "<nenhum>":
             parts.append(f"<b>Equipe:</b> {row.get(equipe_col, '')}")
@@ -375,7 +422,7 @@ else:
             color=color_for(d), weight=3, opacity=0.85
         ).add_child(folium.Tooltip(tip_html, sticky=True)).add_to(m)
 
-    html(html_str := m._repr_html_(), height=650)
+    html(m._repr_html_(), height=650)
 
     map_html = m.get_root().render()
     st.download_button("⬇️ Baixar Mapa (HTML)", data=map_html.encode("utf-8"),
